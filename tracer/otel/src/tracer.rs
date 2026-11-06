@@ -533,11 +533,18 @@ macro_rules! tracer_impl {
                 }
                 fn element_change_state_post(
                     &self,
-                    _: u64,
+                    ts: u64,
                     element: &gst::Element,
                     change: gst::StateChange,
                     result: Result<gst::StateChangeSuccess, gst::StateChangeError>,
                 ) {
+                    // Establish the worker clock before streaming starts, when
+                    // first-buffer callback setup or another tracer can delay us.
+                    if let Ok(runtime) = runtime() {
+                        if runtime.config.traces {
+                            runtime.anchor(ts);
+                        }
+                    }
                     #[cfg(all(feature = "profiles", target_os = "linux"))]
                     crate::nvtxcontext::state_post(element, change);
                     if element.is::<gst::Pipeline>()

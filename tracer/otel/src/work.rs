@@ -16,6 +16,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
         Arc,
     },
+    time::Instant,
 };
 
 /// Owned batch lifetime; contains no reference to the input buffer or element.
@@ -23,6 +24,7 @@ pub struct Work {
     runtime: &'static Runtime,
     token: Token,
     record: Option<Record>,
+    started_at: Instant,
     profiled: AtomicBool,
     #[cfg(feature = "profiles")]
     owner: crate::profilecontext::Description,
@@ -36,8 +38,11 @@ impl Work {
         if !runtime.config.traces || !runtime.accepting() {
             return None;
         }
-        let mut token = capture::work_parent(buffer)?;
-        let start = runtime.hook_now().unwrap_or(0);
+        let (mut token, parent_start) = capture::work_parent(buffer)?;
+        let started_at = Instant::now();
+        // Hook timestamps precede callback dispatch. Calibration can lag by
+        // that dispatch cost; an active parent supplies a causal lower bound.
+        let start = runtime.hook_now().unwrap_or(0).max(parent_start);
         if token.sampled() {
             if let Some(budget) = &token.budget {
                 if let Err(reason) = budget.admit(start) {
@@ -99,9 +104,14 @@ impl Work {
             runtime,
             token,
             record,
+            started_at,
             profiled: AtomicBool::new(false),
             #[cfg(feature = "profiles")]
-            owner: crate::metadata::profile_id(element.upcast_ref()),
+            owner: if crate::profilecontext::enabled() && crate::profiles::active() {
+                crate::metadata::profile_id(element.upcast_ref())
+            } else {
+                None
+            },
         })
     }
 
@@ -118,6 +128,7 @@ impl Work {
         let (entered, profiled) = capture::work_enter(
             identity,
             self.token.clone(),
+            self.record.as_ref().map_or(0, |record| record.start),
             self.record.is_some() && self.runtime.accepting(),
         );
         if profiled {
@@ -147,7 +158,9 @@ impl Work {
 impl Drop for Work {
     fn drop(&mut self) {
         if let Some(mut record) = self.record.take() {
-            record.end = self.runtime.hook_now().unwrap_or(record.start);
+            record.end = record
+                .start
+                .saturating_add(self.started_at.elapsed().as_nanos() as u64);
             record.profiled = self.profiled.load(Relaxed);
             self.runtime.submit(record);
         }

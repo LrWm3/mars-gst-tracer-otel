@@ -1,5 +1,5 @@
 //! Inspect exported spans from deferred work, including cancellation and limits.
-use gstreamer::{self as gst, prelude::*};
+use gstreamer::{self as gst, prelude::*, subclass::prelude::*};
 use opentelemetry_proto::tonic::{
     collector::trace::v1::ExportTraceServiceRequest, trace::v1::Span,
 };
@@ -10,9 +10,40 @@ use std::{
     time::Duration,
 };
 
+mod delayed {
+    use super::*;
+    #[derive(Default)]
+    pub struct Dispatch(std::sync::atomic::AtomicBool);
+    #[glib::object_subclass]
+    impl ObjectSubclass for Dispatch {
+        const NAME: &'static str = "MarsWorkDelayedDispatch";
+        type Type = super::DelayedDispatch;
+        type ParentType = gst::Tracer;
+    }
+    impl ObjectImpl for Dispatch {
+        fn constructed(&self) {
+            self.parent_constructed();
+            self.register_hook(TracerHook::PadPushPre);
+        }
+    }
+    impl GstObjectImpl for Dispatch {}
+    impl TracerImpl for Dispatch {
+        fn pad_push_pre(&self, _: u64, _: &gst::Pad, _: &gst::Buffer) {
+            if !self.0.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                // GStreamer timestamps before dispatching to all tracers. Delay
+                // Mars's first calibration while later hooks run normally.
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+glib::wrapper! {
+    pub struct DelayedDispatch(ObjectSubclass<delayed::Dispatch>) @extends gst::Tracer, gst::Object;
+}
+
 #[test]
 fn queued_work_preserves_parentage_cancellation_and_shared_limits() {
-    for mode in ["normal", "budget", "age", "off"] {
+    for mode in ["normal", "delayed-dispatch", "budget", "age", "off"] {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let url = format!("http://{}", server.server_addr());
         let (stop, stopping) = mpsc::channel();
@@ -66,7 +97,15 @@ fn queued_work_preserves_parentage_cancellation_and_shared_limits() {
             .iter()
             .filter(|s| s.name == "gst.element.process identity")
             .collect();
-        assert_eq!(work.len(), if mode == "normal" { 3 } else { 2 }, "{mode}");
+        assert_eq!(
+            work.len(),
+            if matches!(mode, "normal" | "delayed-dispatch") {
+                3
+            } else {
+                2
+            },
+            "{mode}"
+        );
         assert_eq!(
             work.iter()
                 .filter(|s| s.status.as_ref().is_some_and(|s| s.code == 2))
@@ -116,6 +155,7 @@ fn work_child() {
             if mode == "age" { 100u32 } else { 5000u32 },
         )
         .build();
+    let _delay = (mode == "delayed-dispatch").then(glib::Object::new::<DelayedDispatch>);
     let pipeline =
         gst::parse::launch("fakesrc num-buffers=2 ! identity name=worker ! fakesink sync=false")
             .unwrap()
@@ -150,7 +190,7 @@ fn work_child() {
     let cancelled = jobs.pop().unwrap();
     drop(cancelled);
     let (job, buffer) = jobs.pop().unwrap();
-    let sampled = mode == "normal";
+    let sampled = matches!(mode.as_str(), "normal" | "delayed-dispatch");
     std::thread::spawn(move || {
         assert!(gstoteltracer::current_span_context().is_none());
         {
@@ -187,4 +227,10 @@ fn work_child() {
     if mode == "age" {
         assert!(stats.trace_age_rejections > 0);
     }
+    #[cfg(feature = "profiles")]
+    assert_eq!(
+        gstoteltracer::profile_stats().context_descriptions,
+        0,
+        "trace-only work must not allocate profile descriptions"
+    );
 }

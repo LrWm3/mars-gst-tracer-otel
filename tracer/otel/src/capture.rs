@@ -112,6 +112,7 @@ struct Frame {
     pad: usize,
     operation: Operation,
     token: Token,
+    start: u64,
     recording: bool,
     timing: Option<crate::metrics::Timing>,
 }
@@ -201,21 +202,26 @@ pub(crate) fn current_context() -> Option<SpanContext> {
     })
 }
 
-pub(crate) fn work_parent(buffer: &gst::Buffer) -> Option<Token> {
+pub(crate) fn work_parent(buffer: &gst::Buffer) -> Option<(Token, u64)> {
     LOCAL.with(|local| {
         let state = local.try_borrow().ok()?;
         if state.overflow != 0 || state.profile_invalid {
-            return Some(Token::rejected());
+            return Some((Token::rejected(), 0));
         }
         state
             .frames
             .last()
-            .map(|frame| frame.token.clone())
-            .or_else(|| crate::propagation::read(buffer))
+            .map(|frame| (frame.token.clone(), frame.start))
+            .or_else(|| crate::propagation::read(buffer).map(|token| (token, 0)))
     })
 }
 
-pub(crate) fn work_enter(identity: usize, token: Token, recording: bool) -> (bool, bool) {
+pub(crate) fn work_enter(
+    identity: usize,
+    token: Token,
+    start: u64,
+    recording: bool,
+) -> (bool, bool) {
     crate::profiles::clear();
     #[cfg(feature = "profiles")]
     crate::profiles::register_thread();
@@ -229,6 +235,7 @@ pub(crate) fn work_enter(identity: usize, token: Token, recording: bool) -> (boo
             pad: identity,
             operation: Operation::Process,
             token,
+            start,
             recording,
             timing: None,
         });
@@ -486,6 +493,7 @@ fn begin_local(
             pad: pad.as_ptr() as usize,
             operation,
             token,
+            start: ts,
             recording,
             timing: None,
         });
