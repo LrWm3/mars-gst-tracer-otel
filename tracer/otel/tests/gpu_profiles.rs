@@ -43,6 +43,8 @@ fn deferred_gpu_profiles_keep_element_and_span_without_cpu_sampling() {
         "window-property",
         "window-params",
         "combined-window",
+        "async-work",
+        "combined-async-work",
     ] {
         let output = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "gpu_child", "--ignored", "--nocapture"])
@@ -105,6 +107,7 @@ fn gpu_child() {
     let reject = mode == "reject";
     let slow = mode == "timeout";
     let combined = mode.starts_with("combined");
+    let async_work = mode.contains("async-work");
     let split = mode == "split-reports";
     let window = mode.contains("window");
     let traces = mode != "profiles-only";
@@ -123,6 +126,7 @@ fn gpu_child() {
     let worker = std::thread::spawn(move || {
         let mut profiles = Vec::new();
         let mut cpu_samples = 0;
+        let mut worker_cpu_spans = HashSet::new();
         let mut instance = None;
         while stopping.try_recv().is_err() {
             let Some(mut request) = server.recv_timeout(Duration::from_millis(10)).unwrap() else {
@@ -196,6 +200,32 @@ fn gpu_child() {
                             profiles.push(profile);
                         } else {
                             cpu_samples += profile.sample.len();
+                            if async_work {
+                                for sample in &profile.sample {
+                                    let Some(span) = sample.label.iter().find(|l| {
+                                        profile.string_table[l.key as usize] == "span_id"
+                                    }) else {
+                                        continue;
+                                    };
+                                    let location = profile
+                                        .location
+                                        .iter()
+                                        .find(|l| Some(&l.id) == sample.location_id.last())
+                                        .unwrap();
+                                    let function = profile
+                                        .function
+                                        .iter()
+                                        .find(|f| f.id == location.line[0].function_id)
+                                        .unwrap();
+                                    let owner = &profile.string_table[function.name as usize];
+                                    assert!(
+                                        owner.starts_with("[element]"),
+                                        "worker sample missing owner: {owner}"
+                                    );
+                                    worker_cpu_spans
+                                        .insert(profile.string_table[span.str as usize].clone());
+                                }
+                            }
                         }
                     }
                 }
@@ -211,7 +241,7 @@ fn gpu_child() {
                 }))
                 .unwrap();
         }
-        (profiles, cpu_samples)
+        (profiles, cpu_samples, worker_cpu_spans)
     });
     gst::init().unwrap();
     let sources = if combined {
@@ -328,12 +358,21 @@ fn gpu_child() {
     let pipeline = gst::parse::launch("fakesrc num-buffers=2 ! identity name=first ! queue ! identity name=second ! fakesink sync=false")
         .unwrap().downcast::<gst::Pipeline>().unwrap();
     let expected = std::sync::Arc::new(std::sync::Mutex::new(HashSet::new()));
+    let jobs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     for name in ["first", "second"] {
         let expected = expected.clone();
+        let jobs = jobs.clone();
         pipeline
             .by_name(name)
             .unwrap()
-            .connect("handoff", false, move |_| {
+            .connect("handoff", false, move |values| {
+                if async_work {
+                    let element = values[0].get::<gst::Element>().unwrap();
+                    let buffer = values[1].get::<gst::Buffer>().unwrap();
+                    let job = gstoteltracer::work::Work::capture(&element, &buffer).unwrap();
+                    jobs.lock().unwrap().push((name.to_owned(), job));
+                    return None;
+                }
                 let span = gstoteltracer::current_span_context();
                 assert_eq!(span.is_some(), traces);
                 expected.lock().unwrap().insert((
@@ -361,6 +400,33 @@ fn gpu_child() {
         .unwrap();
     assert_eq!(message.type_(), gst::MessageType::Eos);
     drop(message);
+    // Run in reverse admission order after every source call has returned.
+    // The adapter delivers activities only later, after jobs and scopes drop.
+    for (name, job) in jobs.lock().unwrap().drain(..).rev() {
+        let expected = expected.clone();
+        std::thread::spawn(move || {
+            assert!(gstoteltracer::current_span_context().is_none());
+            {
+                let _scope = job.enter();
+                let span = gstoteltracer::current_span_context().unwrap();
+                expected
+                    .lock()
+                    .unwrap()
+                    .insert((name, span.span_id().to_string()));
+                unsafe { launch() };
+                if combined {
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < Duration::from_millis(40) {
+                        std::hint::black_box((0u64..1000).sum::<u64>());
+                    }
+                }
+            }
+            assert!(gstoteltracer::current_span_context().is_none());
+            job.finish(gst::ffi::GST_FLOW_OK);
+        })
+        .join()
+        .unwrap();
+    }
     pipeline.set_state(gst::State::Null).unwrap();
     drop(pipeline);
     if window {
@@ -438,8 +504,18 @@ fn gpu_child() {
     );
     assert!(cpu.context_retired >= 5);
     stop.send(()).unwrap();
-    let (profiles, cpu_samples) = worker.join().unwrap();
+    let (profiles, cpu_samples, worker_cpu_spans) = worker.join().unwrap();
     assert_eq!(cpu_samples > 0, combined);
+    if async_work && combined {
+        assert!(!worker_cpu_spans.is_empty());
+        let expected_spans: HashSet<_> = expected
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, span)| span.clone())
+            .collect();
+        assert!(worker_cpu_spans.is_subset(&expected_spans));
+    }
     let mut actual = HashSet::new();
     let mut nanos = 0;
     if split {

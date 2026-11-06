@@ -384,6 +384,47 @@ pub(crate) fn end(pad: &gst::Pad, operation: u8) {
     });
 }
 
+// Unlike NVTX ownership scopes, these scopes carry an explicit async trace handoff.
+pub(crate) fn explicit_enter(identity: usize, owner: Description) {
+    if !active() {
+        return;
+    }
+    crate::profiles::publish_element(0, false);
+    LOCAL.with(|local| {
+        let mut state = local.0.borrow_mut();
+        state.enter(identity, 4, owner);
+        crate::profiles::publish_element(state.current(), state.correlation_allowed());
+    });
+}
+
+pub(crate) fn explicit_leave(identity: usize) {
+    if !active() {
+        return;
+    }
+    crate::profiles::publish_element(0, false);
+    let _ = LOCAL.try_with(|local| {
+        let Ok(mut state) = local.0.try_borrow_mut() else {
+            return;
+        };
+        if state.overflow != 0 {
+            state.overflow -= 1;
+        } else if let Some(index) = state
+            .calls
+            .iter()
+            .position(|(id, op, _)| *id == identity && *op == 4)
+        {
+            if index + 1 != state.calls.len() {
+                state.invalid = true;
+            }
+            state.calls.remove(index);
+        }
+        if state.calls.is_empty() && state.overflow == 0 {
+            state.invalid = false;
+        }
+        crate::profiles::publish_element(state.current(), state.correlation_allowed());
+    });
+}
+
 pub(crate) fn message(element: &gst::Element, message: &gst::Message) {
     if !active() {
         return;

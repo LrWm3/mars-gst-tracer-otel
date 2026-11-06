@@ -45,6 +45,7 @@ mod tracebudget;
 mod tracer;
 mod transport;
 mod wire;
+pub mod work;
 
 pub use export::{ExportStats, FlushError};
 #[cfg(all(feature = "gpu-profiles", target_os = "linux"))]

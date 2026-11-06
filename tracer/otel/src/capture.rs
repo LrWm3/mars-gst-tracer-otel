@@ -10,7 +10,7 @@ use opentelemetry_sdk::trace::{IdGenerator, RandomIdGenerator};
 use crate::export::{text_value, Runtime};
 
 const MAX_DEPTH: usize = 256;
-static IDS: LazyLock<RandomIdGenerator> = LazyLock::new(RandomIdGenerator::default);
+pub(crate) static IDS: LazyLock<RandomIdGenerator> = LazyLock::new(RandomIdGenerator::default);
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Token {
@@ -69,6 +69,7 @@ pub(crate) enum Operation {
     Push,
     Pull,
     PushList,
+    Process,
 }
 impl Operation {
     pub fn name(self) -> &'static str {
@@ -76,6 +77,7 @@ impl Operation {
             Self::Push => "gst.pad.push",
             Self::Pull => "gst.pad.pull_range",
             Self::PushList => "gst.pad.push_list",
+            Self::Process => "gst.element.process",
         }
     }
     pub fn error(self, flow_return: i32) -> Option<&'static str> {
@@ -85,6 +87,7 @@ impl Operation {
                 Self::Push => "GStreamer push failed",
                 Self::Pull => "GStreamer pull failed",
                 Self::PushList => "GStreamer buffer-list push failed",
+                Self::Process => "GStreamer asynchronous processing failed",
             })
     }
 }
@@ -193,8 +196,69 @@ pub(crate) fn current_context() -> Option<SpanContext> {
         local
             .try_borrow()
             .ok()
+            .filter(|s| s.overflow == 0 && !s.profile_invalid)
             .and_then(|s| s.frames.last().map(|f| f.token.context()))
     })
+}
+
+pub(crate) fn work_parent(buffer: &gst::Buffer) -> Option<Token> {
+    LOCAL.with(|local| {
+        let state = local.try_borrow().ok()?;
+        if state.overflow != 0 || state.profile_invalid {
+            return Some(Token::rejected());
+        }
+        state
+            .frames
+            .last()
+            .map(|frame| frame.token.clone())
+            .or_else(|| crate::propagation::read(buffer))
+    })
+}
+
+pub(crate) fn work_enter(identity: usize, token: Token, recording: bool) -> (bool, bool) {
+    crate::profiles::clear();
+    #[cfg(feature = "profiles")]
+    crate::profiles::register_thread();
+    LOCAL.with(|local| {
+        let mut state = local.borrow_mut();
+        if state.overflow != 0 || state.frames.len() == MAX_DEPTH {
+            state.overflow += 1;
+            return (false, false);
+        }
+        state.frames.push(Frame {
+            pad: identity,
+            operation: Operation::Process,
+            token,
+            recording,
+            timing: None,
+        });
+        (true, publish_profile(&state))
+    })
+}
+
+pub(crate) fn work_leave(identity: usize, entered: bool) {
+    crate::profiles::clear();
+    let _ = LOCAL.try_with(|local| {
+        let Ok(mut state) = local.try_borrow_mut() else {
+            return;
+        };
+        if !entered {
+            state.overflow = state.overflow.saturating_sub(1);
+        } else if let Some(index) = state
+            .frames
+            .iter()
+            .position(|f| f.pad == identity && f.operation == Operation::Process)
+        {
+            if index + 1 != state.frames.len() {
+                state.profile_invalid = true;
+            }
+            state.frames.remove(index);
+        }
+        if state.frames.is_empty() && state.overflow == 0 {
+            state.profile_invalid = false;
+        }
+        publish_profile(&state);
+    });
 }
 
 pub(crate) fn begin(runtime: &Runtime, ts: u64, pad: &gst::Pad, buffer: &gst::Buffer) {
@@ -234,6 +298,9 @@ fn begin_local(
     operation: Operation,
     list: Option<&gst::BufferList>,
 ) {
+    // Calibrate at hook entry, before descriptor/metadata initialization. Worker
+    // spans extrapolate this clock between callbacks.
+    runtime.anchor(ts);
     crate::profiles::clear();
     // Resolve TLS once. Individual borrows still end before GStreamer calls,
     // allowing callbacks and the optional log bridge to inspect the context.
@@ -340,7 +407,6 @@ fn begin_local(
         let site = site.unwrap();
         token.span_id = IDS.new_span_id();
         token.is_remote = false;
-        runtime.anchor(ts);
         runtime.stats.local().started_spans.fetch_add(1, Relaxed);
         let thread = {
             let mut state = local.borrow_mut();
@@ -391,6 +457,7 @@ fn begin_local(
                 Operation::Push => &stats.unsampled_pushes,
                 Operation::Pull => &stats.unsampled_pulls,
                 Operation::PushList => &stats.unsampled_lists,
+                Operation::Process => unreachable!("processing is admitted by the work API"),
             }
             .fetch_add(1, Relaxed);
         }

@@ -270,6 +270,7 @@ impl Metrics {
             stop: AtomicBool::new(false),
             stopped: OnceLock::new(),
             anchor: Anchor {
+                steady: std::time::Instant::now(),
                 hook_ts: gstreamer::get_timestamp().nseconds(),
                 wall: SystemTime::now(),
             },

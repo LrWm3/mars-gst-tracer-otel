@@ -158,12 +158,13 @@ impl Encoder {
                 + usize::from(record.profiled)
                 + usize::from(record.list_len.is_some());
             let mut remaining = config.attribute_limit;
-            static OPERATIONS: std::sync::LazyLock<[EncodedAttributes; 3]> =
+            static OPERATIONS: std::sync::LazyLock<[EncodedAttributes; 4]> =
                 std::sync::LazyLock::new(|| {
                     [
                         crate::capture::Operation::Push,
                         crate::capture::Operation::Pull,
                         crate::capture::Operation::PushList,
+                        crate::capture::Operation::Process,
                     ]
                     .map(|op| EncodedAttributes::new([KeyValue::new("gst.operation", op.name())]))
                 });
@@ -297,6 +298,7 @@ mod tests {
             .with_attribute(KeyValue::new("service.name", "test"))
             .build();
         let anchor = Anchor {
+            steady: std::time::Instant::now(),
             hook_ts: 100,
             wall: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000),
         };
@@ -387,6 +389,7 @@ mod tests {
             )
             .build();
         let anchor = Anchor {
+            steady: std::time::Instant::now(),
             hook_ts: 100,
             wall: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
         };
@@ -470,6 +473,7 @@ mod tests {
             .with_attribute(KeyValue::new("service.name", "encoding-bench"))
             .build();
         let anchor = Anchor {
+            steady: std::time::Instant::now(),
             hook_ts: 100,
             wall: SystemTime::UNIX_EPOCH + Duration::from_secs(1000),
         };

@@ -99,6 +99,10 @@ collection. Enable it with `profile-nvtx-adapter="/absolute/path/libmars-nvtx.so
 and the NVIDIA injection setup in that guide. Other private worker pools remain
 outside automatic attribution.
 
+Custom elements can announce their private worker with standard thread-status
+messages. The experimental [asynchronous work API](WORK_CONTEXT.md) additionally
+hands off per-job context for trace-linked CPU and GPU profiles.
+
 Attribution does not recover missing native symbols. Events, queries, and
 arbitrary callbacks have no separate scope hooks; they retain the surrounding
 call/task context. Task-owner names are captured at ENTER; chain descriptions

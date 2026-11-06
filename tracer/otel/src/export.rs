@@ -220,6 +220,7 @@ pub(crate) fn text_value(value: &str, limit: usize) -> Arc<str> {
 pub(crate) struct Anchor {
     pub hook_ts: u64,
     pub wall: SystemTime,
+    pub steady: Instant,
 }
 impl Anchor {
     pub fn nanos(&self, ts: u64) -> u64 {
@@ -385,7 +386,17 @@ impl Runtime {
         self.anchor.get_or_init(|| Anchor {
             hook_ts: ts,
             wall: SystemTime::now(),
+            steady: Instant::now(),
         });
+    }
+
+    // Explicit worker spans use the same time domain as tracer callbacks.
+    pub(crate) fn hook_now(&self) -> Option<u64> {
+        self.anchor.get().map(|anchor| {
+            anchor
+                .hook_ts
+                .saturating_add(anchor.steady.elapsed().as_nanos() as u64)
+        })
     }
 
     pub fn timestamp(&self, ts: u64) -> u64 {
