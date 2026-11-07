@@ -2,6 +2,9 @@
 use pyroscope::backend::StackFrame;
 use std::{collections::HashMap, fs::File, os::unix::fs::MetadataExt, path::PathBuf};
 
+#[path = "profilefiles.rs"]
+mod files;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum Symbolization {
     #[default]
@@ -29,6 +32,8 @@ struct Mapping {
     device: u64,
     inode: u64,
     path: PathBuf,
+    readable: bool,
+    executable: bool,
 }
 impl Mapping {
     fn parse(line: &str) -> Option<Self> {
@@ -41,7 +46,10 @@ impl Mapping {
             value
         };
         let (start, end) = field().split_once('-')?;
-        if !field().contains('x') {
+        let permissions = field();
+        let readable = permissions.contains('r');
+        let executable = permissions.contains('x');
+        if !readable && !executable {
             return None;
         }
         let offset = u64::from_str_radix(field(), 16).ok()?;
@@ -64,13 +72,19 @@ impl Mapping {
             device,
             inode,
             path,
+            readable,
+            executable,
         })
     }
-    fn open(&self) -> Option<File> {
+    fn open(&self, mappings: &[Self]) -> Option<File> {
         let file = File::open(&self.path).ok()?;
         let metadata = file.metadata().ok()?;
         // Do not symbolize against a replacement file at the same path.
-        (metadata.ino() == self.inode && metadata.dev() == self.device).then_some(file)
+        // Overlay filesystems can expose different identities through stat and
+        // maps. Validate the loaded ELF before accepting that alternate view.
+        ((metadata.ino() == self.inode && metadata.dev() == self.device)
+            || files::matches(&file, self, mappings))
+        .then_some(file)
     }
 }
 
@@ -123,12 +137,16 @@ impl Symbols {
     }
 
     pub fn refresh(&mut self, pcs: &[usize]) {
-        let mut evicted = 0;
         let mappings: Vec<_> = std::fs::read_to_string("/proc/self/maps")
             .unwrap_or_default()
             .lines()
             .filter_map(Mapping::parse)
             .collect();
+        self.refresh_mappings(pcs, mappings);
+    }
+
+    fn refresh_mappings(&mut self, pcs: &[usize], mappings: Vec<Mapping>) {
+        let mut evicted = 0;
         if self.mappings != mappings {
             evicted += self.mappings(mappings);
         }
@@ -164,7 +182,7 @@ impl Symbols {
         // PCs are sorted, so each ELF/DWARF context is built once per report
         // and dropped before loading the next file. No global resolver lock,
         // libunwind, dladdr, or dl_iterate_phdr (which takes the loader lock).
-        for mapping in self.mappings.clone() {
+        for mapping in self.mappings.clone().into_iter().filter(|m| m.executable) {
             let first = pcs.partition_point(|pc| *pc < mapping.start);
             let last = pcs.partition_point(|pc| *pc < mapping.end);
             let missing: Vec<_> = pcs[first..last]
@@ -175,7 +193,9 @@ impl Symbols {
             if missing.is_empty() || self.frames.len() == MAX_SYMBOLS {
                 continue;
             }
-            let Some(file) = mapping.open() else { continue };
+            let Some(file) = mapping.open(&self.mappings) else {
+                continue;
+            };
             use object::{Object, ObjectSegment};
             let cache = object::read::ReadCache::new(&file);
             let Ok(object) = object::File::parse(&cache) else {
@@ -346,6 +366,46 @@ fn resolve_file(
 mod tests {
     use super::*;
     use std::{ffi::c_void, time::Duration};
+
+    fn alternate_filesystem_view(pc: usize) -> Vec<Mapping> {
+        let mut mappings: Vec<_> = std::fs::read_to_string("/proc/self/maps")
+            .unwrap()
+            .lines()
+            .filter_map(Mapping::parse)
+            .collect();
+        let path = mappings
+            .iter()
+            .find(|m| m.start <= pc && pc < m.end)
+            .unwrap()
+            .path
+            .clone();
+        for mapping in mappings.iter_mut().filter(|m| m.path == path) {
+            mapping.device ^= 1;
+        }
+        mappings
+    }
+
+    #[test]
+    fn alternate_filesystem_identity_preserves_function_and_full_symbols() {
+        let pc = resolve_file as *const () as usize;
+        for mode in [Symbolization::Functions, Symbolization::Full] {
+            let mut ordinary = Symbols::new(mode);
+            ordinary.refresh(&[pc]);
+            let mut alternate = Symbols::new(mode);
+            alternate.refresh_mappings(&[pc], alternate_filesystem_view(pc));
+            assert_eq!(alternate.frames.get(&pc), ordinary.frames.get(&pc));
+            assert!(alternate.frames[&pc]
+                .iter()
+                .any(|f| f.name.as_ref().is_some_and(|n| n.contains("resolve_file"))));
+            let pointer = alternate.frames[&pc].as_ptr();
+            alternate.refresh_mappings(&[pc], alternate_filesystem_view(pc));
+            assert_eq!(
+                pointer,
+                alternate.frames[&pc].as_ptr(),
+                "validated symbols must stay cached"
+            );
+        }
+    }
 
     #[test]
     fn function_mode_resolves_names_without_source_or_inline_frames() {
@@ -530,10 +590,15 @@ mod tests {
             ready.recv().unwrap();
             let mut symbols = Symbols::default();
             symbols.refresh(&[pc]);
-            let valid = symbols.frames.get(&pc) == Some(&expected);
+            let mut valid = symbols.frames.get(&pc) == Some(&expected);
             let old = symbols.frames.get(&pc).map(Vec::as_ptr);
             let mappings = symbols.mappings.clone();
             symbols.refresh(&[pc]);
+            // Also exercise mapped build-ID validation while the loader is
+            // locked, regardless of the test host's filesystem layout.
+            let mut alternate = Symbols::default();
+            alternate.refresh_mappings(&[pc], alternate_filesystem_view(pc));
+            valid &= alternate.frames.get(&pc) == Some(&expected);
             // Other tests may load GStreamer plugins concurrently. Reuse
             // cached frames only when the executable mappings stayed put.
             let _ = finished.send(
@@ -572,6 +637,8 @@ mod tests {
             Mapping::parse("00401000-00405000 r-xp 00001000 08:01 123 /removed.so (deleted)")
                 .is_none()
         );
-        assert!(Mapping::parse("00401000-00405000 rw-p 00001000 08:01 123 /data.so").is_none());
+        let data = Mapping::parse("00401000-00405000 r--p 00001000 08:01 123 /data.so").unwrap();
+        assert!(data.readable && !data.executable);
+        assert!(Mapping::parse("00401000-00405000 ---p 00001000 08:01 123 /data.so").is_none());
     }
 }

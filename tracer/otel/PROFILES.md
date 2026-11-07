@@ -177,6 +177,16 @@ at the cost of source locations and inline detail; stripped private functions
 may appear only under their library name. Element roots and trace IDs are
 unchanged. `MARS_PROFILE_SYMBOLIZATION` and `GST_OTEL_PROFILE_SYMBOLIZATION` remain environment fallbacks.
 
+Both modes validate a library before reading its symbols. When a container's
+overlay filesystem reports different device/inode IDs from the process mappings,
+the resolver checks the file against the mapped ELF headers, load layout and GNU
+build ID. This fallback uses bounded reads through `/proc/self/mem` on the report
+worker, without taking the dynamic-loader lock or requiring access to
+`/proc/self/map_files`. Missing/unreadable build IDs, incompatible layouts and
+replaced binaries remain unresolved. Debug files are still needed for stripped
+private functions and source information; switching modes does not bypass file
+validation. Validation runs on symbol-cache misses, not on the sampling thread.
+
 The worker keeps up to 4096 resolved addresses and 4 MiB of frame/string data.
 Loading an unrelated library preserves existing cached symbols; replacing or
 unmapping a library invalidates its addresses. Capacity pressure evicts stale
