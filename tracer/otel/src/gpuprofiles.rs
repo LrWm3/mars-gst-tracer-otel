@@ -17,6 +17,8 @@ use std::{
 
 #[path = "gpuprofileencode.rs"]
 mod encode;
+#[path = "gpukernelnames.rs"]
+mod names;
 
 const CAPACITY: usize = 8192;
 const CONTEXT_TTL: Duration = Duration::from_secs(30);
@@ -338,6 +340,8 @@ struct Joiner {
     // attribution key only once, while a launch still holds its element lease.
     elements: HashMap<u64, Arc<str>>,
     kernels: HashSet<Arc<str>>,
+    // Formatted names outlive individual reports; bounded and idle-expiring.
+    names: names::Cache,
     timestamps: encode::Timestamps,
 }
 impl Joiner {
@@ -444,7 +448,12 @@ impl Joiner {
         drain: bool,
     ) -> Result<(), FlushError> {
         let mut result = Ok(());
-        let batches = encode::batches(self.groups.drain(), counters, &mut self.timestamps);
+        let batches = encode::batches(
+            self.groups.drain(),
+            counters,
+            &mut self.timestamps,
+            &mut self.names,
+        );
         self.elements.clear();
         self.kernels.clear();
         for (batch, kernels) in batches {

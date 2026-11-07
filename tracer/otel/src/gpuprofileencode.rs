@@ -1,12 +1,12 @@
 //! Two-level pprof: exclusive GStreamer owner -> CUDA kernel. Profile timestamps
 //! describe submission windows; weights describe measured device durations.
-use super::{Counters, Key, Value};
+use super::{names, Counters, Key, Value};
 use prost::Message;
 use pyroscope::{
     backend::{ReportBatch, ReportData},
     encode::gen::google::{Function, Label, Line, Location, Profile, Sample, ValueType},
 };
-use std::{collections::HashMap, sync::atomic::Ordering::Relaxed};
+use std::{collections::HashMap, sync::atomic::Ordering::Relaxed, time::Instant};
 
 const SECOND: u64 = 1_000_000_000;
 
@@ -40,13 +40,17 @@ pub(super) fn batches(
     groups: impl IntoIterator<Item = (Key, Value)>,
     counters: &Counters,
     timestamps: &mut Timestamps,
+    names: &mut names::Cache,
 ) -> Vec<(ReportBatch, u64)> {
+    let now = Instant::now();
+    names.expire(now);
     let mut buckets: HashMap<u64, Builder> = HashMap::new();
     for (key, value) in groups {
+        let display = names.get(&key.kernel, now);
         buckets
             .entry(key.bucket)
             .or_insert_with(Builder::new)
-            .sample(key, value);
+            .sample(key, value, &display);
     }
     buckets
         .into_iter()
@@ -112,15 +116,17 @@ impl Builder {
         self.strings.insert(value.into(), id);
         id
     }
-    fn frame(&mut self, name: &str) -> u64 {
-        if let Some(id) = self.frames.get(name) {
+    fn frame(&mut self, raw: &str, display: &str) -> u64 {
+        if let Some(id) = self.frames.get(raw) {
             return *id;
         }
-        let name_id = self.string(name);
+        let name_id = self.string(display);
+        let system_name = self.string(raw);
         let id = self.profile.function.len() as u64 + 1;
         self.profile.function.push(Function {
             id,
             name: name_id,
+            system_name,
             ..Default::default()
         });
         self.profile.location.push(Location {
@@ -131,7 +137,7 @@ impl Builder {
             }],
             ..Default::default()
         });
-        self.frames.insert(name.into(), id);
+        self.frames.insert(raw.into(), id);
         id
     }
     fn label(&mut self, key: &str, value: &str) -> Label {
@@ -141,8 +147,11 @@ impl Builder {
             ..Default::default()
         }
     }
-    fn sample(&mut self, key: Key, value: Value) {
-        let location_id = vec![self.frame(&key.kernel), self.frame(&key.element)];
+    fn sample(&mut self, key: Key, value: Value, display: &str) {
+        let location_id = vec![
+            self.frame(&key.kernel, display),
+            self.frame(&key.element, &key.element),
+        ];
         let mut label = Vec::with_capacity(if key.ids == [0; 3] { 1 } else { 3 });
         label.push(self.label("gpu_device", &key.device.to_string()));
         if key.ids != [0; 3] {
@@ -182,7 +191,12 @@ mod tests {
                 },
             );
         }
-        let batches = batches(groups, &Counters::default(), &mut Timestamps::default());
+        let batches = batches(
+            groups,
+            &Counters::default(),
+            &mut Timestamps::default(),
+            &mut names::Cache::default(),
+        );
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].1, 4);
         assert_eq!(batches[0].0.profile_type, "gpu_kernel");
@@ -231,5 +245,60 @@ mod tests {
         assert_eq!(timestamps.allocate(42), Some((42_999_999_999, 1)));
         assert_eq!(timestamps.allocate(42), None);
         assert_eq!(Timestamps::default().allocate(u64::MAX), None);
+    }
+
+    #[test]
+    fn compact_kernel_names_preserve_raw_identity_and_overload_accounting() {
+        let mut names = names::Cache::default();
+        let mut timestamps = Timestamps::default();
+        let raw = std::sync::Arc::from("_Z6kernelPi");
+        let cached = names.get(&raw, Instant::now());
+        for bucket in [42, 43] {
+            let groups = [("_Z6kernelPi", 100), ("_Z6kernelPf", 200)].map(|(raw, nanos)| {
+                (
+                    Key {
+                        bucket,
+                        ids: [1, 2, 3],
+                        element: "[task owner] worker".into(),
+                        kernel: raw.into(),
+                        device: 0,
+                    },
+                    Value { nanos, kernels: 1 },
+                )
+            });
+            let batches = batches(groups, &Counters::default(), &mut timestamps, &mut names);
+            let ReportData::RawPprof(ref bytes) = batches[0].0.data else {
+                panic!()
+            };
+            let profile = Profile::decode(bytes.as_slice()).unwrap();
+            let functions: Vec<_> = profile
+                .function
+                .iter()
+                .filter(|f| profile.string_table[f.system_name as usize].starts_with("_Z"))
+                .collect();
+            assert_eq!(functions.len(), 2);
+            assert_ne!(functions[0].name, functions[1].name);
+            assert!(functions
+                .iter()
+                .all(|f| profile.string_table[f.name as usize].starts_with("kernel [")));
+            let mut weights = HashMap::new();
+            for sample in &profile.sample {
+                assert_eq!(sample.location_id.len(), 2);
+                let location = &profile.location[(sample.location_id[0] - 1) as usize];
+                let function = &profile.function[(location.line[0].function_id - 1) as usize];
+                weights.insert(
+                    profile.string_table[function.system_name as usize].as_str(),
+                    sample.value[0],
+                );
+            }
+            assert_eq!(
+                weights,
+                HashMap::from([("_Z6kernelPi", 100), ("_Z6kernelPf", 200)])
+            );
+            assert!(std::sync::Arc::ptr_eq(
+                &cached,
+                &names.get(&raw, Instant::now())
+            ));
+        }
     }
 }
