@@ -31,6 +31,7 @@ fn deferred_gpu_profiles_keep_element_and_span_without_cpu_sampling() {
     for mode in [
         "success",
         "long-name",
+        "generated-name",
         "reject",
         "timeout",
         "combined",
@@ -106,8 +107,13 @@ fn deferred_gpu_profiles_keep_element_and_span_without_cpu_sampling() {
 fn gpu_child() {
     let mode = std::env::var("GPU_TEST_MODE").unwrap();
     let long_name = mode == "long-name";
-    let raw_name = format!("_Z6kernelI300{}Evv", "a".repeat(300));
-    if long_name {
+    let generated_name = mode == "generated-name";
+    let raw_name = if generated_name {
+        "sm80_xmma_fprop_implicit_gemm_f16f16_f16f16_f16_nhwckrsc_nhwc_tilesize128x32x32_stage4_warpsize4x1x1_g1_tensor16x8x16_simple_t1r1s1_linkable_execute_kernel_trt".to_owned()
+    } else {
+        format!("_Z6kernelI300{}Evv", "a".repeat(300))
+    };
+    if long_name || generated_name {
         std::env::set_var("MARS_GPU_MOCK_NAME", &raw_name);
     }
     let reject = mode == "reject";
@@ -560,9 +566,15 @@ fn gpu_child() {
                     profile.string_table[function.name as usize].as_str()
                 })
                 .collect();
-            if long_name {
-                assert!(names[0].starts_with("kernel<"));
-                assert!(names[0].contains(&"a".repeat(300)));
+            if long_name || generated_name {
+                if generated_name {
+                    assert!(names[0].starts_with(
+                        "SM80 XMMA implicit GEMM fprop (FP16, NHWC, tile 128x32x32) ["
+                    ));
+                } else {
+                    assert!(names[0].starts_with("kernel<"));
+                    assert!(names[0].contains(&"a".repeat(300)));
+                }
                 let loc = profile
                     .location
                     .iter()

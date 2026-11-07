@@ -8,6 +8,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "gpukerneldisplay.rs"]
+mod display;
+
 const MAX_NAMES: usize = 1024;
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_DISPLAY: usize = 4096;
@@ -91,17 +94,25 @@ impl Write for BoundedName {
 }
 
 fn compact(raw: &str) -> Option<String> {
-    if raw.len() > super::symbols::MAX_RAW || !raw.starts_with("_Z") {
+    if raw.len() > super::symbols::MAX_RAW {
         return None;
     }
-    let symbol =
-        Symbol::new_with_options(raw, &ParseOptions::default().recursion_limit(64)).ok()?;
-    let options = DemangleOptions::default()
-        .no_params()
-        .no_return_type()
-        .recursion_limit(64);
-    let mut display = BoundedName(String::new());
-    symbol.structured_demangle(&mut display, &options).ok()?;
+    let mut display = if let Some(name) = display::format(raw) {
+        BoundedName(name)
+    } else {
+        if !raw.starts_with("_Z") {
+            return None;
+        }
+        let symbol =
+            Symbol::new_with_options(raw, &ParseOptions::default().recursion_limit(64)).ok()?;
+        let options = DemangleOptions::default()
+            .no_params()
+            .no_return_type()
+            .recursion_limit(64);
+        let mut display = BoundedName(String::new());
+        symbol.structured_demangle(&mut display, &options).ok()?;
+        display
+    };
     if display.0.is_empty() {
         return None;
     }
@@ -165,6 +176,20 @@ mod tests {
         let expanded = format!("_Z6kernelI100{}{}Evv", "A".repeat(100), "S0_".repeat(48));
         assert!(Symbol::new(&expanded).unwrap().demangle().unwrap().len() > MAX_DISPLAY);
         assert!(compact(&expanded).is_none());
+    }
+
+    #[test]
+    fn generated_variants_retain_distinct_identities_and_share_the_cache() {
+        let raw: Arc<str> = "sm80_xmma_fprop_implicit_gemm_f16f16_f16f16_f16_nhwckrsc_nhwc_tilesize128x32x32_stage4_warpsize4x1x1_g1_tensor16x8x16_simple_t1r1s1_linkable_execute_kernel_trt".into();
+        let other: Arc<str> = raw.replace("stage4", "stage3").into();
+        let mut cache = Cache::default();
+        let now = Instant::now();
+        let first = cache.get(&raw, now);
+        let second = cache.get(&other, now);
+        assert!(first.starts_with("SM80 XMMA"));
+        assert_eq!(first.split(" [").next(), second.split(" [").next());
+        assert_ne!(first, second);
+        assert!(Arc::ptr_eq(&first, &cache.get(&raw, now)));
     }
 
     #[test]

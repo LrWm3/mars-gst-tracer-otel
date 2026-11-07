@@ -32,8 +32,24 @@ example, a mangled softmax symbol becomes
 The identifier distinguishes overloads when Pyroscope groups frames by display
 name. The original symbol as received from the adapter is retained in pprof's
 `system_name`, and aggregation continues to use that original symbol. Generated
-names such as `generatedNativePointwise` and `sm80_xmma_...` remain unchanged;
-invalid or truncated mangled names also retain their original spelling.
+names such as `generatedNativePointwise` remain unchanged; invalid or truncated
+mangled names also retain their original spelling.
+
+A separate display formatter summarizes recognized generated kernel families:
+
+- `sm80_xmma_fprop_implicit_gemm_...` becomes
+  `SM80 XMMA implicit GEMM fprop (FP16, NHWC, tile 128x32x32) [<symbol id>]`.
+  Indexed variants retain their `indexed_wo_smem` tag.
+- `trt_ampere_h1688cudnn_...` becomes
+  `TensorRT cuDNN h1688 (Ampere, ReLU, NHWC, tile 256x64) [<symbol id>]`.
+
+Only validated patterns are formatted. Unknown precision/layout/algorithm
+variants and malformed names keep their original spelling. The identifier is
+computed from the entire original name, including hidden tuning fields, so two
+variants with the same summary remain distinct. Raw symbols and aggregation
+identity are preserved. This formatter uses the same bounded display cache as
+C++ demangling. These are kernel implementation descriptions, not model-layer
+names. Older captures retain their previous display names.
 
 Formatting results, including failures, are cached across reports. The cache
 holds at most 1,024 names and 1 MiB of symbol text, plus bounded entry overhead.
