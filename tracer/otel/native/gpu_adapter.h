@@ -2,6 +2,7 @@
 #ifndef MARS_GPU_ADAPTER_H
 #define MARS_GPU_ADAPTER_H
 #include <stdint.h>
+#include <stddef.h>
 typedef struct {
     uint32_t kind; /* 1: host launch, 2: completed kernel, 3: lost records */
     uint32_t correlation;
@@ -16,6 +17,16 @@ _Static_assert(sizeof(MarsGpuEvent) == 296, "Mars GPU ABI v1 layout");
 typedef void (*MarsGpuReceive)(const MarsGpuEvent *);
 int mars_gpu_start_v1(MarsGpuReceive receive);
 int mars_gpu_flush_v1(uint32_t stop);
+
+/* Optional full-name interface. Record layout/flush remain v1. For kind 2,
+ * name points to name_len UTF-8 bytes valid ONLY during receive. The receiver
+ * must own the bytes before returning; it must not queue the borrowed pointer.
+ * name_len > MARS_GPU_MAX_NAME_BYTES is a counted drop, never a truncated name.
+ * Non-kernel records pass NULL/0. Hosts prefer v2 and fall back to v1.
+ */
+#define MARS_GPU_MAX_NAME_BYTES (16 * 1024)
+typedef void (*MarsGpuReceiveV2)(const MarsGpuEvent *, const char *name, size_t name_len);
+int mars_gpu_start_v2(MarsGpuReceiveV2 receive);
 
 /* Optional capture-window extension. Configure before start; zero window means
  * continuous capture. Older v1 adapters remain usable for continuous capture.

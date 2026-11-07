@@ -10,7 +10,7 @@ use std::{
 
 const MAX_NAMES: usize = 1024;
 const MAX_BYTES: usize = 1024 * 1024;
-const MAX_DISPLAY: usize = 1024;
+const MAX_DISPLAY: usize = 4096;
 const IDLE: Duration = Duration::from_secs(60);
 
 struct Entry {
@@ -33,7 +33,7 @@ impl Cache {
         }
         // The adapter ABI already bounds names. Do not cache a larger name if
         // an internal caller bypasses it, nor feed oversized input to the parser.
-        if raw.len() > 256 {
+        if raw.len() > super::symbols::MAX_RAW {
             return raw.clone();
         }
         let display = compact(raw).map_or_else(|| raw.clone(), Arc::from);
@@ -91,7 +91,7 @@ impl Write for BoundedName {
 }
 
 fn compact(raw: &str) -> Option<String> {
-    if raw.len() > 256 || !raw.starts_with("_Z") {
+    if raw.len() > super::symbols::MAX_RAW || !raw.starts_with("_Z") {
         return None;
     }
     let symbol =
@@ -162,7 +162,7 @@ mod tests {
         }
         assert!(compact(&format!("_Z{}v", "N".repeat(300))).is_none());
         // Substitutions can expand a short, valid symbol beyond the output cap.
-        let expanded = format!("_Z6kernelI100{}{}Evv", "A".repeat(100), "S0_".repeat(12));
+        let expanded = format!("_Z6kernelI100{}{}Evv", "A".repeat(100), "S0_".repeat(48));
         assert!(Symbol::new(&expanded).unwrap().demangle().unwrap().len() > MAX_DISPLAY);
         assert!(compact(&expanded).is_none());
     }

@@ -22,6 +22,7 @@
 #define BUFFER_SIZE (256 * 1024)
 static struct { unsigned char *data; atomic_bool busy; } buffers[BUFFER_COUNT];
 static MarsGpuReceive receiver;
+static MarsGpuReceiveV2 receiver_v2;
 static CUpti_SubscriberHandle subscriber;
 static int started;
 static pthread_mutex_t api_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -36,6 +37,21 @@ static int set_capture(int active) {
         : cuptiActivityDisable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
     pthread_mutex_unlock(&api_lock);
     return (int)result;
+}
+
+/* Names are borrowed from CUPTI only while delivering this callback. The
+ * receiver owns/interns full names before return; host launch callbacks do not
+ * look up names or allocate symbol storage. Legacy hosts keep their v1 ABI. */
+static void deliver(MarsGpuEvent *event, const char *name) {
+    if (receiver_v2) {
+        if (event->kind == 2) {
+            if (!name) name = "";
+            receiver_v2(event, name, strnlen(name, MARS_GPU_MAX_NAME_BYTES + 1));
+        } else receiver_v2(event, NULL, 0);
+    } else {
+        if (name) memcpy(event->name, name, strnlen(name, sizeof(event->name) - 1));
+        receiver(event);
+    }
 }
 
 static void CUPTIAPI request_buffer(uint8_t **buffer, size_t *size, size_t *max_records) {
@@ -61,18 +77,14 @@ static void CUPTIAPI complete_buffer(CUcontext context, uint32_t stream,
         MarsGpuEvent event = { .kind = 2, .correlation = kernel->correlationId,
             .start = kernel->start, .end = kernel->end,
             .device = kernel->deviceId, .stream = kernel->streamId };
-        if (kernel->name) {
-            size_t len = strnlen(kernel->name, sizeof(event.name) - 1);
-            memcpy(event.name, kernel->name, len);
-        }
-        receiver(&event);
+        deliver(&event, kernel->name);
     }
     if (result != CUPTI_ERROR_MAX_LIMIT_REACHED) {
-        MarsGpuEvent error = { .kind = 3, .count = 1 }; receiver(&error);
+        MarsGpuEvent error = { .kind = 3, .count = 1 }; deliver(&error, NULL);
     }
     size_t dropped = 0;
     if (cuptiActivityGetNumDroppedRecords(context, stream, &dropped) == CUPTI_SUCCESS && dropped) {
-        MarsGpuEvent lost = { .kind = 3, .count = dropped }; receiver(&lost);
+        MarsGpuEvent lost = { .kind = 3, .count = dropped }; deliver(&lost, NULL);
     }
     for (unsigned i = 0; i < BUFFER_COUNT; ++i) {
         if (buffers[i].data == buffer) { atomic_store(&buffers[i].busy, 0); break; }
@@ -92,11 +104,10 @@ static void CUPTIAPI on_api(void *userdata, CUpti_CallbackDomain domain,
     if (clock_gettime(CLOCK_REALTIME, &now) != 0) return;
     MarsGpuEvent launch = { .kind = 1, .correlation = callback->correlationId,
         .start = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec };
-    receiver(&launch);
+    deliver(&launch, NULL);
 }
 
-int mars_gpu_start_v1(MarsGpuReceive receive) {
-    if (started || !receive) return -1;
+static int start(void) {
     uint32_t version = 0;
     CUptiResult result = cuptiGetVersion(&version);
     if (result != CUPTI_SUCCESS) return (int)result;
@@ -112,7 +123,6 @@ int mars_gpu_start_v1(MarsGpuReceive receive) {
     if (result != CUPTI_SUCCESS) return (int)result;
     result = cuptiActivitySetAttribute(CUPTI_ACTIVITY_ATTR_DEVICE_BUFFER_PRE_ALLOCATE_VALUE, &value_size, &preallocate);
     if (result != CUPTI_SUCCESS) return (int)result;
-    receiver = receive;
     for (unsigned i = 0; i < BUFFER_COUNT; ++i) {
         if (posix_memalign((void **)&buffers[i].data, 8, BUFFER_SIZE) != 0) return -3;
     }
@@ -147,6 +157,17 @@ fail:
     cuptiUnsubscribe(subscriber);
     cuptiActivityDisable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
     return (int)result;
+}
+
+int mars_gpu_start_v1(MarsGpuReceive receive) {
+    if (started || !receive) return -1;
+    receiver = receive; receiver_v2 = NULL;
+    return start();
+}
+int mars_gpu_start_v2(MarsGpuReceiveV2 receive) {
+    if (started || !receive) return -1;
+    receiver_v2 = receive; receiver = NULL;
+    return start();
 }
 
 int mars_gpu_flush_v1(uint32_t stop) {

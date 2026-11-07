@@ -38,9 +38,20 @@ invalid or truncated mangled names also retain their original spelling.
 Formatting results, including failures, are cached across reports. The cache
 holds at most 1,024 names and 1 MiB of symbol text, plus bounded entry overhead.
 Unused entries expire after 60 seconds; capacity pressure evicts the least
-recently used entries. Demangled output is capped at 1,024 bytes, falling back to
-the original symbol if parsing, recursion or output limits are exceeded. This
-does not add demangling or cache locks to CUDA callbacks.
+recently used entries. Demangled output is capped at 4,096 bytes, falling back to
+the original symbol if parsing, recursion or output limits are exceeded.
+Demangling and display-cache access stay in the report worker.
+
+Rebuild both the Rust plugin and native CUPTI adapter to capture full symbols.
+The optional v2 name interface preserves names up to 16 KiB. Completed-activity
+callbacks intern each distinct name in a shared table capped at 1,024 names and
+1 MiB of text; queued records hold shared references. Table access uses
+`try_lock`, never waits, and never holds its lock across CUPTI calls. Contention,
+capacity exhaustion, invalid UTF-8 and oversized names count as dropped events;
+no truncated name is silently used as a kernel identity. Unreferenced names are
+reclaimed after reports and at shutdown. Host launch callbacks do not access
+this table. Older adapters remain supported through v1, with their 255-byte
+name limit.
 
 ## Enable the experiment
 
@@ -394,8 +405,8 @@ GPU span exemplar back to its trace:
   `DEVICE_BUFFER` attribute names. These limits do not bound total CUPTI RSS.
   The adapter and its
   host buffers remain resident until process exit because CUPTI retains callback
-  addresses. The native adapter copies at most 255 bytes of each raw kernel
-  name. Names truncated before Rust receives them may not demangle.
+  addresses. Full symbols use the bounded v2 name interface described above;
+  the legacy v1 interface retains its 255-byte limit.
 - The existing uploader limits apply independently to GPU profiles: ten queued
   profiles plus one request in flight, bounded payloads and an HTTP timeout.
   Capture uses nonblocking enqueue; report encoding and HTTP run in background.

@@ -19,6 +19,8 @@ use std::{
 mod encode;
 #[path = "gpukernelnames.rs"]
 mod names;
+#[path = "gpukernelsymbols.rs"]
+mod symbols;
 
 const CAPACITY: usize = 8192;
 const CONTEXT_TTL: Duration = Duration::from_secs(30);
@@ -52,6 +54,7 @@ struct Owner {
 struct Message {
     event: Event,
     owner: Option<Owner>,
+    kernel: Option<Arc<str>>,
 }
 enum Command {
     Flush(Sender<Result<(), FlushError>>),
@@ -59,6 +62,7 @@ enum Command {
 }
 struct State {
     events: Sender<Message>,
+    symbols: symbols::Symbols,
     commands: Sender<Command>,
     counters: Arc<Counters>,
     done: (Mutex<Option<Result<(), FlushError>>>, Condvar),
@@ -189,8 +193,38 @@ unsafe extern "C" fn receive(event: *const Event) {
     if event.is_null() {
         return;
     }
-    // SAFETY: adapter ABI guarantees a valid record for this callback's duration.
+    // SAFETY: the v1 adapter owns a valid record for this callback's duration.
+    enqueue(state, unsafe { *event }, None);
+}
+
+unsafe extern "C" fn receive_v2(event: *const Event, name: *const u8, len: usize) {
+    let Some(state) = STATE.get() else { return };
+    if event.is_null() {
+        return;
+    }
+    // SAFETY: v2 retains the v1 record layout and borrows the name only until
+    // this callback returns. No adapter pointers enter the queue.
     let event = unsafe { *event };
+    let kernel = if event.kind == 2 {
+        if name.is_null() || len > symbols::MAX_RAW {
+            state.counters.dropped_events.fetch_add(1, Relaxed);
+            return;
+        }
+        let Some(name) = state
+            .symbols
+            .intern(unsafe { std::slice::from_raw_parts(name, len) })
+        else {
+            state.counters.dropped_events.fetch_add(1, Relaxed);
+            return;
+        };
+        Some(name)
+    } else {
+        None
+    };
+    enqueue(state, event, kernel);
+}
+
+fn enqueue(state: &State, event: Event, kernel: Option<Arc<str>>) {
     if event.kind == 3 {
         state
             .counters
@@ -212,7 +246,15 @@ unsafe extern "C" fn receive(event: *const Event) {
         submitted: event.start,
         seen: Instant::now(),
     });
-    if state.events.try_send(Message { event, owner }).is_err() {
+    if state
+        .events
+        .try_send(Message {
+            event,
+            owner,
+            kernel,
+        })
+        .is_err()
+    {
         state.counters.dropped_events.fetch_add(1, Relaxed);
     }
 }
@@ -248,12 +290,11 @@ impl Adapter {
                 });
             }
             let start = libc::dlsym(handle, c"mars_gpu_start_v1".as_ptr());
+            let start_v2 = libc::dlsym(handle, c"mars_gpu_start_v2".as_ptr());
             let flush = libc::dlsym(handle, c"mars_gpu_flush_v1".as_ptr());
-            if start.is_null() || flush.is_null() {
+            if (start.is_null() && start_v2.is_null()) || flush.is_null() {
                 return Err("GPU adapter ABI v1 symbols missing".into());
             }
-            let start: unsafe extern "C" fn(unsafe extern "C" fn(*const Event)) -> i32 =
-                std::mem::transmute(start);
             let flush: unsafe extern "C" fn(u32) -> i32 = std::mem::transmute(flush);
             let configure = libc::dlsym(handle, c"mars_gpu_configure_capture_v1".as_ptr());
             let stats = libc::dlsym(handle, c"mars_gpu_capture_stats_v1".as_ptr());
@@ -277,7 +318,16 @@ impl Adapter {
                     unsafe extern "C" fn(*mut CaptureStats) -> i32,
                 >(stats))
             };
-            let status = start(receive);
+            let status = if !start_v2.is_null() {
+                let start: unsafe extern "C" fn(
+                    unsafe extern "C" fn(*const Event, *const u8, usize),
+                ) -> i32 = std::mem::transmute(start_v2);
+                start(receive_v2)
+            } else {
+                let start: unsafe extern "C" fn(unsafe extern "C" fn(*const Event)) -> i32 =
+                    std::mem::transmute(start);
+                start(receive)
+            };
             if status != 0 {
                 return Err(format!("CUPTI adapter initialization failed ({status}); check SDK/driver compatibility and profiling access"));
             }
@@ -392,7 +442,9 @@ impl Joiner {
             .position(|v| *v == 0)
             .unwrap_or(event.name.len());
         let name = String::from_utf8_lossy(&event.name[..len]);
-        let kernel = if let Some(kernel) = self.kernels.get(name.as_ref()) {
+        let kernel = if let Some(kernel) = message.kernel {
+            kernel
+        } else if let Some(kernel) = self.kernels.get(name.as_ref()) {
             kernel.clone()
         } else {
             let kernel: Arc<str> = Arc::from(name.as_ref());
@@ -496,6 +548,7 @@ pub(crate) fn initialize(
     STATE
         .set(State {
             events: tx,
+            symbols: symbols::Symbols::default(),
             commands,
             counters: counters.clone(),
             done: (Mutex::new(None), Condvar::new()),
@@ -521,6 +574,7 @@ pub(crate) fn initialize(
             .unwrap_or(Err(FlushError::ExportFailed));
             ACTIVE.store(false, Relaxed);
             let state = STATE.get().unwrap();
+            state.symbols.reclaim();
             *state.done.0.lock().unwrap() = Some(result);
             state.done.1.notify_all();
         })
@@ -580,6 +634,7 @@ fn worker(
         }
         let reported = joiner.report(&uploader, &counters, command.is_some());
         joiner.expire(&counters);
+        STATE.get().unwrap().symbols.reclaim();
         if owns_retirement || crate::profiles::cpu_reports_finished() {
             // The CPU worker otherwise owns retirement. GPU leases keep its
             // descriptions alive until all pending references have gone away.
@@ -674,6 +729,7 @@ mod tests {
                 count: 0,
                 name: [0; 256],
             },
+            kernel: None,
             owner: Some(Owner {
                 ids: [1, 2, 3],
                 element: None,

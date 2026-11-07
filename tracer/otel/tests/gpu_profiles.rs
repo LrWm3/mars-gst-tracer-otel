@@ -30,6 +30,7 @@ fn deferred_gpu_profiles_keep_element_and_span_without_cpu_sampling() {
     assert!(status.success());
     for mode in [
         "success",
+        "long-name",
         "reject",
         "timeout",
         "combined",
@@ -104,6 +105,11 @@ fn deferred_gpu_profiles_keep_element_and_span_without_cpu_sampling() {
 #[ignore]
 fn gpu_child() {
     let mode = std::env::var("GPU_TEST_MODE").unwrap();
+    let long_name = mode == "long-name";
+    let raw_name = format!("_Z6kernelI300{}Evv", "a".repeat(300));
+    if long_name {
+        std::env::set_var("MARS_GPU_MOCK_NAME", &raw_name);
+    }
     let reject = mode == "reject";
     let slow = mode == "timeout";
     let combined = mode.starts_with("combined");
@@ -554,7 +560,26 @@ fn gpu_child() {
                     profile.string_table[function.name as usize].as_str()
                 })
                 .collect();
-            assert_eq!(names[0], "same_kernel");
+            if long_name {
+                assert!(names[0].starts_with("kernel<"));
+                assert!(names[0].contains(&"a".repeat(300)));
+                let loc = profile
+                    .location
+                    .iter()
+                    .find(|l| l.id == sample.location_id[0])
+                    .unwrap();
+                let function = profile
+                    .function
+                    .iter()
+                    .find(|f| f.id == loc.line[0].function_id)
+                    .unwrap();
+                assert_eq!(
+                    profile.string_table[function.system_name as usize],
+                    raw_name
+                );
+            } else {
+                assert_eq!(names[0], "same_kernel");
+            }
             let element = if names[1].contains("first [identity]") {
                 "first"
             } else {

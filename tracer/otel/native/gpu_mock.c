@@ -5,9 +5,33 @@
 #include "gpu_capture.h"
 #endif
 #include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 static MarsGpuReceive receiver;
+#ifndef MARS_GPU_LEGACY_MOCK
+static MarsGpuReceiveV2 receiver_v2;
+int mars_gpu_start_v2(MarsGpuReceiveV2 receive) {
+    receiver_v2 = receive;
+    return mars_gpu_start_v1(NULL);
+}
+#endif
+static void deliver(const MarsGpuEvent *event) {
+#ifndef MARS_GPU_LEGACY_MOCK
+    if (receiver_v2) {
+        const char *name = event->kind == 2 ? getenv("MARS_GPU_MOCK_NAME") : NULL;
+        if (event->kind == 2 && !name) name = event->name;
+        /* Mutable, short-lived storage catches receivers that queue pointers. */
+        char bytes[MARS_GPU_MAX_NAME_BYTES + 1];
+        size_t len = name ? strnlen(name, sizeof(bytes)) : 0;
+        if (len < sizeof(bytes)) memcpy(bytes, name ? name : "", len);
+        receiver_v2(event, name ? bytes : NULL, len);
+        memset(bytes, '!', sizeof(bytes));
+        return;
+    }
+#endif
+    receiver(event);
+}
 static MarsGpuEvent kernels[256];
 static unsigned next, pending;
 static uint64_t submission_second;
@@ -43,7 +67,7 @@ void mars_gpu_mock_launch_v1(void) {
     MarsGpuEvent launch = { .kind = 1, .correlation = ++next,
         .start = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec };
     if (submission_second) launch.start = submission_second;
-    receiver(&launch);
+    deliver(&launch);
     if (pending < 256) {
         MarsGpuEvent kernel = { .kind = 2, .correlation = launch.correlation, .start = 1, .end = 10000001 };
         strcpy(kernel.name, "same_kernel");
@@ -58,7 +82,7 @@ int mars_gpu_flush_v1(uint32_t stop) {
     (void)stop;
     pthread_mutex_lock(&lock);
     unsigned count = submission_second && pending ? 1 : pending;
-    for (unsigned i = 0; i < count; ++i) receiver(&kernels[i]);
+    for (unsigned i = 0; i < count; ++i) deliver(&kernels[i]);
     pending -= count;
     memmove(kernels, kernels + count, pending * sizeof(kernels[0]));
     pthread_mutex_unlock(&lock);
