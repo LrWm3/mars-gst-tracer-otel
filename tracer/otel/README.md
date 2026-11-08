@@ -697,6 +697,15 @@ retain all failures, including ones already reported during pipeline stop.
 
 ## Correlation boundaries
 
+- A synchronous output normally inherits the active call. If that call was
+  locally rejected by root throttling/sampling, an output with **copied sampled
+  input metadata** can instead continue that input's journey. This handles a
+  depayloader emitting a completed frame on a later, rejected packet. The
+  contributor keeps its original age/span budget. Valid external rejections
+  and exhausted active journeys remain rejected; ordinary shared-ancestor
+  metadata does not override the call. Sources still reset recycled buffers.
+  Two sampled parents retain the active-call precedence. This uses preserved
+  metadata, not a per-element latch or a guess based on timestamps.
 - Shared buffers cannot safely accept mutable metadata. Branches retain the
   last common ancestor; exact immediate parentage across every branch is not
   promised. A shared root can replace that ancestor through a lazily initialized,

@@ -61,6 +61,9 @@ fn same_span(a: &Token, b: &Token) -> bool {
 pub(crate) struct Input {
     pub token: Token,
     pub links: Option<Arc<Links>>,
+    // A transform/explicit merge supplied input provenance. Ordinary writes
+    // consume this evidence so a recycled/shared buffer is not a fresh input.
+    pub derived: bool,
 }
 impl Input {
     fn merge(&mut self, other: &Input) {
@@ -83,7 +86,7 @@ fn api() -> glib::ffi::GType {
     static API: OnceLock<glib::ffi::GType> = OnceLock::new();
     *API.get_or_init(|| unsafe {
         let mut tags = [std::ptr::null()];
-        gst::ffi::gst_meta_api_type_register(c"GstOtelContextV5API".as_ptr(), tags.as_mut_ptr())
+        gst::ffi::gst_meta_api_type_register(c"GstOtelContextV6API".as_ptr(), tags.as_mut_ptr())
     })
 }
 fn info() -> *const gst::ffi::GstMetaInfo {
@@ -92,7 +95,7 @@ fn info() -> *const gst::ffi::GstMetaInfo {
     *INFO.get_or_init(|| unsafe {
         gst::ffi::gst_meta_register(
             api(),
-            c"GstOtelContextV5".as_ptr(),
+            c"GstOtelContextV6".as_ptr(),
             std::mem::size_of::<ContextMeta>(),
             Some(init),
             Some(free),
@@ -112,7 +115,11 @@ unsafe extern "C" fn init(
     };
     std::ptr::write(
         std::ptr::addr_of_mut!((*(meta as *mut ContextMeta)).input),
-        std::mem::ManuallyDrop::new(Input { token, links: None }),
+        std::mem::ManuallyDrop::new(Input {
+            token,
+            links: None,
+            derived: false,
+        }),
     );
     std::ptr::write(
         std::ptr::addr_of_mut!((*(meta as *mut ContextMeta)).shared),
@@ -131,14 +138,16 @@ unsafe extern "C" fn transform(
     _: glib::ffi::GQuark,
     _: glib::ffi::gpointer,
 ) -> glib::ffi::gboolean {
-    let input =
+    let mut input =
         read_raw(source).unwrap_or_else(|| Input::clone(&(*(meta as *const ContextMeta)).input));
+    input.derived = true;
     let existing = gst::ffi::gst_buffer_get_meta(dest, api()) as *mut ContextMeta;
     if !existing.is_null() {
         // A metadata-copy destination is writable. Preserve the first parent,
         // adding bounded links for other inputs rather than another ContextMeta.
         let mut first = read_raw(dest).unwrap();
         first.merge(&input);
+        first.derived = true;
         let existing = &mut *existing;
         if let Some(shared) = existing.shared.get() {
             *shared.token.write().unwrap() = None;
@@ -158,7 +167,7 @@ unsafe extern "C" fn transform(
 // remain stable until buffer destruction. INSTALL_LOCK covers first installation;
 // GStreamer's qdata getter also takes its own global lock on every lookup.
 static FALLBACK_QUARK: LazyLock<glib::Quark> =
-    LazyLock::new(|| glib::Quark::from_str("gst.otel.fallback.v5"));
+    LazyLock::new(|| glib::Quark::from_str("gst.otel.fallback.v6"));
 static INSTALL_LOCK: Mutex<()> = Mutex::new(());
 struct Fallback {
     token: RwLock<Option<Token>>,
@@ -205,6 +214,7 @@ unsafe fn read_raw(buffer: *mut gst::ffi::GstBuffer) -> Option<Input> {
                 return Some(Input {
                     token: token.clone(),
                     links: None,
+                    derived: false,
                 });
             }
         }
@@ -218,6 +228,7 @@ unsafe fn read_raw(buffer: *mut gst::ffi::GstBuffer) -> Option<Input> {
             return Some(Input {
                 token: token.clone(),
                 links: None,
+                derived: false,
             });
         }
     }
@@ -230,6 +241,23 @@ pub(crate) fn read(buffer: &gst::Buffer) -> Option<Token> {
 
 pub(crate) fn read_input(buffer: &gst::BufferRef) -> Option<Input> {
     unsafe { read_raw(buffer.as_ptr() as *mut _) }
+}
+
+// Only consult owned metadata, never an initially-shared qdata fallback. A
+// shared-root override invalidates the copied evidence through read_raw().
+pub(crate) fn read_derived_sampled(buffer: &gst::BufferRef) -> Option<Token> {
+    unsafe {
+        let ptr = buffer.as_ptr() as *mut gst::ffi::GstBuffer;
+        let meta = (gst::ffi::gst_buffer_get_meta(ptr, api()) as *const ContextMeta).as_ref()?;
+        if !meta.input.derived {
+            return None;
+        }
+        read_raw(ptr)
+            .filter(|input| {
+                input.derived && input.token.sampled() && input.token.context().is_valid()
+            })
+            .map(|input| input.token)
+    }
 }
 
 // The common single-input path needs no cloned token or qdata fallback lookup.
@@ -249,6 +277,7 @@ fn merge_inputs(mut inputs: impl Iterator<Item = Input>) -> (Input, usize) {
             Input {
                 token: Token::rejected(),
                 links: None,
+                derived: false,
             },
             0,
         );
@@ -266,6 +295,7 @@ fn merge_inputs(mut inputs: impl Iterator<Item = Input>) -> (Input, usize) {
     if let Some(links) = links {
         first.links = links.finish();
     }
+    first.derived = true;
     (first, count)
 }
 
@@ -308,6 +338,7 @@ pub(crate) fn write(buffer: &gst::Buffer, token: &Token, is_root: bool, counters
                 }
                 let input = &mut *(*meta).input;
                 input.links = None;
+                input.derived = false;
                 // No outstanding borrowed token escapes read(); buffer writability
                 // excludes concurrent access to its metadata.
                 // Rejected descendants carry the same decision and identity.
@@ -579,6 +610,7 @@ mod tests {
     fn fan_in_inherited_drop_counts_saturate_without_retained_links() {
         let inputs = [u32::MAX - 1, 7].map(|dropped| Input {
             token: token(1),
+            derived: true,
             links: Some(Arc::new(Links {
                 tokens: Vec::new(),
                 dropped,
@@ -611,6 +643,7 @@ mod tests {
                 merged.unwrap_or(Input {
                     token: Token::rejected(),
                     links: None,
+                    derived: false,
                 }),
                 count,
             )

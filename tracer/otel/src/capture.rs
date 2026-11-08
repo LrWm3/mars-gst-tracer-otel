@@ -10,6 +10,9 @@ use opentelemetry_sdk::trace::{IdGenerator, RandomIdGenerator};
 use crate::export::{text_value, Runtime};
 
 const MAX_DEPTH: usize = 256;
+#[cfg(test)]
+#[path = "capture_provenance_tests.rs"]
+mod provenance_tests;
 pub(crate) static IDS: LazyLock<RandomIdGenerator> = LazyLock::new(RandomIdGenerator::default);
 
 #[derive(Clone, Debug, PartialEq)]
@@ -336,22 +339,38 @@ fn begin_local(
     let mut parent_token = if !runtime.config.traces {
         Token::rejected()
     } else {
-        inherited.unwrap_or_else(|| {
-            if is_root {
-                root_for_pad(runtime, pad, ts)
-            } else {
-                buffer
-                    .and_then(crate::propagation::read)
-                    .unwrap_or_else(|| {
-                        runtime
-                            .stats
-                            .local()
-                            .propagation_misses
-                            .fetch_add(1, Relaxed);
-                        Token::rejected()
-                    })
-            }
-        })
+        inherited
+            .map(|parent| {
+                // An assembled output can retain an earlier sampled contributor
+                // even when a later, locally rejected packet triggers emission.
+                // Valid rejected parents (external decisions or spent budgets)
+                // remain authoritative. Ordinary/shared ancestor metadata is not
+                // evidence of a newly derived output. The selected contributor's
+                // existing shared budget still undergoes admission below.
+                if !parent.sampled() && parent.span_id == SpanId::INVALID {
+                    buffer
+                        .and_then(|buffer| crate::propagation::read_derived_sampled(buffer))
+                        .unwrap_or(parent)
+                } else {
+                    parent
+                }
+            })
+            .unwrap_or_else(|| {
+                if is_root {
+                    root_for_pad(runtime, pad, ts)
+                } else {
+                    buffer
+                        .and_then(crate::propagation::read)
+                        .unwrap_or_else(|| {
+                            runtime
+                                .stats
+                                .local()
+                                .propagation_misses
+                                .fetch_add(1, Relaxed);
+                            Token::rejected()
+                        })
+                }
+            })
     };
     if is_root
         && parent_token.sampled()
