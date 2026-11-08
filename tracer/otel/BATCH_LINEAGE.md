@@ -6,9 +6,9 @@ metadata ownership and copy callbacks; it does not match frames by PTS, buffer
 address, source order, or a timeout. It is separate from GPU profiling and does
 not require the `gpu-profiles` Cargo feature.
 
-**Status:** local parent-selection tests and native DeepStream 6.2 metadata
-round trips pass. Actual mux/demux execution on a GPU device is still pending.
-Keep this opt-in until validated against the deployed SDK and pipeline.
+**Status:** local parent-selection tests, native SDK metadata round trips, and
+real DeepStream 6.2 mux/demux checks pass. This remains opt-in: validate the SDK
+version and metadata behavior of your pipeline before enabling it.
 
 ## Enable
 
@@ -101,9 +101,28 @@ restoration, a rejected first input, shared output overrides, the new-mux copy
 helper, missing/ambiguous/oversized metadata, recycled inputs, and 1,000 ownership
 cycles that release every tracked journey budget.
 
-Before deployment, run the real pipeline and check these counters, contributor
-links, per-frame trace IDs, and enabled/disabled overhead with normal trace
-limits. Private processor evidence belongs outside this repository.
+The [real pipeline check](examples/batch_lineage.rs) runs two video streams
+through `nvvideoconvert`, `nvstreammux`, `nvstreamdemux`, and downstream queues:
+
+```sh
+cargo run -p gst-otel-tracer --release --example batch_lineage -- \
+  /opt/mars/libmars-deepstream-batch.so
+cargo run -p gst-otel-tracer --release --example batch_lineage -- \
+  /opt/mars/libmars-deepstream-batch.so mixed
+# Control, with the adapter disabled:
+cargo run -p gst-otel-tracer --release --example batch_lineage -- -
+```
+
+On an integrated memory NVIDIA device, all 40 outputs retained the matching
+input trace with the adapter enabled. The control retained the correct input
+trace for 20/40 outputs. With the normal 16 ms root gate at 100 fps, 20 sampled
+and 20 rejected frames all retained their original decision. No contexts were
+missing and no adapter failures occurred. PTS is used only as the test oracle;
+the adapter itself relies on SDK-owned frame metadata.
+
+For your deployment, check these counters, contributor links, per-frame trace
+IDs, and enabled/disabled overhead with normal trace limits. Private processor
+evidence belongs outside this repository.
 
 This does not activate context inside an element's private inference worker.
 That integration remains unchanged; see [worker context](WORK_CONTEXT.md).

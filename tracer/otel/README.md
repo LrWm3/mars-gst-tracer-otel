@@ -700,7 +700,7 @@ retain all failures, including ones already reported during pipeline stop.
 - [Experimental batch lineage](BATCH_LINEAGE.md) is available through the
   optional `trace-batch-adapter` property for DeepStream video mux/demux paths.
   It preserves per-frame decisions and links shared batch work. It is disabled
-  by default; SDK metadata tests pass, but device mux/demux validation is pending.
+  by default; SDK metadata and real DeepStream 6.2 mux/demux checks pass.
 - A synchronous output normally inherits the active call. If that call was
   locally rejected by root throttling/sampling, an output with **copied sampled
   input metadata** can instead continue that input's journey. This handles a
