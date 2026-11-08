@@ -32,6 +32,7 @@ struct PadState {
     epoch: AtomicU64,
     // Generation in the high bits, source classification in bit zero.
     source: AtomicU64,
+    batch_role: AtomicU64,
     root_gate: ArcSwapOption<RootGate>,
     site: ArcSwapOption<Site>,
     #[cfg(feature = "profiles")]
@@ -96,9 +97,9 @@ impl Drop for Watchers {
         self.invalidate();
     }
 }
-static STATE: LazyLock<glib::Quark> = LazyLock::new(|| glib::Quark::from_str("gst.otel.pad.v3"));
+static STATE: LazyLock<glib::Quark> = LazyLock::new(|| glib::Quark::from_str("gst.otel.pad.v4"));
 static WATCHERS: LazyLock<glib::Quark> =
-    LazyLock::new(|| glib::Quark::from_str("gst.otel.watchers.v3"));
+    LazyLock::new(|| glib::Quark::from_str("gst.otel.watchers.v4"));
 // Only first-use and descriptor rebuilds enter this lock, never cached reads.
 static SETUP: Mutex<()> = Mutex::new(());
 unsafe extern "C" fn drop_state(ptr: glib::ffi::gpointer) {
@@ -119,6 +120,7 @@ fn state(object: &impl IsA<gst::Object>) -> &Arc<PadState> {
             let candidate = Box::into_raw(Box::new(Arc::new(PadState {
                 epoch: AtomicU64::new(1),
                 source: AtomicU64::new(0),
+                batch_role: AtomicU64::new(0),
                 root_gate: ArcSwapOption::empty(),
                 site: ArcSwapOption::empty(),
                 #[cfg(feature = "profiles")]
@@ -275,6 +277,47 @@ pub(crate) fn is_source(pad: &gst::Pad) -> bool {
         .source
         .store((epoch << 1) | u64::from(source), Relaxed);
     source
+}
+
+// Only consulted when the optional adapter is configured. Like source flags,
+// the classification is cached and invalidated on relinking/reparenting.
+pub(crate) fn batch_role(pad: &gst::Pad) -> u8 {
+    let state = state(pad);
+    let epoch = state.epoch.load(Relaxed);
+    let cached = state.batch_role.load(Relaxed);
+    if cached >> 3 == epoch {
+        return (cached & 7) as u8;
+    }
+    watch_path(pad.upcast_ref(), state);
+    let peer = pad.peer();
+    if let Some(peer) = &peer {
+        watch_path(peer.upcast_ref(), state);
+    }
+    let factory = |pad: &gst::Pad| {
+        pad.parent_element()
+            .and_then(|e| e.factory())
+            .map(|f| f.name())
+    };
+    let mut role = match factory(pad).as_deref() {
+        Some("nvstreammux") => crate::batchlineage::BATCH_OUTPUT,
+        Some("nvstreamdemux") => crate::batchlineage::FRAME_OUTPUT,
+        _ => 0,
+    };
+    if peer.as_ref().and_then(factory).as_deref() == Some("nvstreammux") {
+        role |= crate::batchlineage::FRAME_INPUT;
+    }
+    state
+        .batch_role
+        .store((epoch << 3) | u64::from(role), Relaxed);
+    role
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_batch_role(pad: &gst::Pad, role: u8) {
+    let state = state(pad);
+    state
+        .batch_role
+        .store((state.epoch.load(Relaxed) << 3) | u64::from(role), Relaxed);
 }
 
 pub(crate) fn site(pad: &gst::Pad, limit: usize) -> Arc<Site> {

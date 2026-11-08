@@ -79,6 +79,10 @@ pub(crate) static EXPORT: LazyLock<Vec<Spec>> = LazyLock::new(export_specs);
 
 fn export_specs() -> Vec<Spec> {
     vec![
+        Spec::string(
+            "trace-batch-adapter", &[], None,
+            "Optional batch lineage adapter library (Linux); unset disables",
+        ),
         Spec::number_with_default(
             "trace-max-age-ms",
             u32::MAX,

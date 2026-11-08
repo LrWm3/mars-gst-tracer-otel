@@ -76,6 +76,7 @@ counters! {
     rejected_spans, export_warnings,
     unsampled_pushes, unsampled_pulls, unsampled_lists, skipped_closed, propagation_misses, propagation_fallbacks,
     dropped_depth, mismatched_hooks, throttled_roots, trace_age_rejections, trace_span_rejections,
+    batch_frames, batch_missing_context, batch_adapter_failures,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +108,7 @@ pub(crate) struct Config {
     pub attribute_limit: usize,
     pub value_length_limit: usize,
     pub logs: bool,
+    pub batch_adapter: Option<String>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -124,6 +126,7 @@ impl Default for Config {
             attribute_limit: 128,
             value_length_limit: 4096,
             logs: false,
+            batch_adapter: None,
         }
     }
 }
@@ -181,6 +184,8 @@ impl Config {
         c.root_min_period_ns = (read("trace-root-min-period-us")? as u64) * 1_000;
         c.max_trace_age_ns = (read("trace-max-age-ms")? as u64) * 1_000_000;
         c.max_trace_spans = read("trace-max-spans")? as u64;
+        c.batch_adapter =
+            overrides.read_named(&crate::properties::EXPORT, "trace-batch-adapter", &env)?;
         c.batch_size =
             if !overrides.contains("trace-batch-size") && env("GST_OTEL_BATCH_SIZE").is_none() {
                 c.batch_size.min(c.queue_capacity)
@@ -304,6 +309,7 @@ pub(crate) struct Runtime {
     pub stats: Arc<Counters>,
     pub metrics: Option<crate::metrics::Metrics>,
     pub shared_metrics: Option<crate::shared_metrics::Metrics>,
+    pub batch_lineage: Option<crate::batchlineage::Adapter>,
     sender: Sender<Message>,
     accepting: AtomicBool,
     worker_done: Receiver<()>,
@@ -319,6 +325,15 @@ impl Runtime {
         resource: Resource,
     ) -> std::io::Result<Self> {
         exporter.set_resource(&resource);
+        let batch_lineage = if config.traces {
+            config
+                .batch_adapter
+                .as_deref()
+                .map(crate::batchlineage::Adapter::load)
+                .transpose()?
+        } else {
+            None
+        };
         let (sender, receiver) = bounded(if config.traces {
             config.queue_capacity
         } else {
@@ -368,6 +383,7 @@ impl Runtime {
             stats,
             metrics: None,
             shared_metrics: None,
+            batch_lineage,
             sender,
             accepting: AtomicBool::new(true),
             worker_done,

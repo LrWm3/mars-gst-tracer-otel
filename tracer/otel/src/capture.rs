@@ -333,11 +333,47 @@ fn begin_local(
     // A real source starts a new buffer journey, even when a buffer was recycled.
     // A top-level pull has no input buffer: the caller is asking upstream to
     // produce one. Nested pulls share the active decision, including rejection.
+    let batch_role = if runtime.batch_lineage.is_some() && operation != Operation::Pull {
+        crate::metadata::batch_role(pad)
+    } else {
+        0
+    };
     let is_root = runtime.config.traces
         && inherited.is_none()
+        && batch_role & (crate::batchlineage::BATCH_OUTPUT | crate::batchlineage::FRAME_OUTPUT)
+            == 0
         && (operation == Operation::Pull || crate::metadata::is_source(pad));
+    let batch_input = runtime.batch_lineage.as_ref().and_then(|adapter| {
+        if batch_role & (crate::batchlineage::BATCH_OUTPUT | crate::batchlineage::FRAME_OUTPUT) == 0
+        {
+            return None;
+        }
+        buffer.map(|buffer| {
+            if list.is_some() {
+                runtime
+                    .stats
+                    .local()
+                    .batch_adapter_failures
+                    .fetch_add(1, Relaxed);
+                crate::propagation::Input {
+                    token: Token::rejected(),
+                    links: None,
+                    derived: true,
+                }
+            } else {
+                adapter.parent(
+                    buffer,
+                    batch_role & crate::batchlineage::FRAME_OUTPUT != 0,
+                    inherited.as_ref(),
+                    &runtime.stats,
+                )
+            }
+        })
+    });
     let mut parent_token = if !runtime.config.traces {
         Token::rejected()
+    } else if let Some(input) = &batch_input {
+        input.token.clone()
     } else {
         inherited
             .map(|parent| {
@@ -406,7 +442,9 @@ fn begin_local(
     let recording = parent_token.sampled() && runtime.accepting();
     let links = if recording && !is_root {
         let mut links = crate::propagation::Links::default();
-        if let Some(list) = list {
+        if let Some(input) = &batch_input {
+            links.extend(input, &parent_token);
+        } else if let Some(list) = list {
             for input in list.iter().filter_map(crate::propagation::read_input) {
                 links.extend(&input, &parent_token);
             }
@@ -497,9 +535,31 @@ fn begin_local(
                     glib::translate::from_glib_borrow(buffer.as_ptr() as *mut gst::ffi::GstBuffer)
                 };
                 crate::propagation::write(&buffer, &token, is_root, &runtime.stats);
+                if batch_role & crate::batchlineage::FRAME_INPUT != 0 {
+                    runtime
+                        .batch_lineage
+                        .as_ref()
+                        .unwrap()
+                        .attach(&buffer, &token, &runtime.stats);
+                }
             }
         } else if let Some(buffer) = buffer {
-            crate::propagation::write(buffer, &token, is_root, &runtime.stats);
+            // Authoritative batch/frame selection must replace a shared
+            // ancestor too, otherwise a later queue would revive the batch's
+            // context instead of this frame's restored journey.
+            crate::propagation::write(
+                buffer,
+                &token,
+                is_root || batch_input.is_some(),
+                &runtime.stats,
+            );
+            if batch_role & crate::batchlineage::FRAME_INPUT != 0 {
+                runtime
+                    .batch_lineage
+                    .as_ref()
+                    .unwrap()
+                    .attach(buffer, &token, &runtime.stats);
+            }
         }
     }
     {

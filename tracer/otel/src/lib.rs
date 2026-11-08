@@ -16,6 +16,7 @@
  * Boston, MA 02110-1301, USA.
  */
 use gstreamer as gst;
+mod batchlineage;
 mod capture;
 mod export;
 #[cfg(all(feature = "gpu-profiles", target_os = "linux"))]
@@ -167,6 +168,7 @@ mod registration_tests {
                     "trace-max-age-ms",
                     "trace-max-spans",
                     "trace-batch-size",
+                    "trace-batch-adapter",
                     "flush-timeout-ms",
                 ] {
                     assert_eq!(class.find_property(name).unwrap().owner_type(), ty);

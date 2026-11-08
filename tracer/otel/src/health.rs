@@ -39,6 +39,22 @@ fn snapshot() -> Vec<proto::MetricFamily> {
     let metrics = runtime.metric_stats();
     let logs = crate::log_stats();
     let profiles = crate::profile_stats();
+    if runtime.batch_lineage.is_some() {
+        for (outcome, count) in [
+            ("observed", traces.batch_frames),
+            ("missing", traces.batch_missing_context),
+            ("adapter_failure", traces.batch_adapter_failures),
+        ] {
+            sample(
+                &mut families,
+                "mars_instrument_batch_contexts_total",
+                "Frame-context observations at batch/demux boundaries and adapter failures",
+                false,
+                count,
+                &[("outcome", outcome)],
+            );
+        }
+    }
     for (reason, count) in [
         ("age", traces.trace_age_rejections),
         ("spans", traces.trace_span_rejections),
